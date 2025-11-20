@@ -156,6 +156,145 @@ def make_matmul_weight_only_node(
     return matmul_weight_only_node, new_inits
 
 
+def make_matmul_weight_only_node_3d(
+    node,
+    weight_shape,
+    num_bits,
+    group_size,
+    k_blocks,
+    q_weight,
+    scale,
+    zero_point,
+    accuracy_level=0,
+):
+    """Build a 3D MatMulNBits node (weights batched as [B, K, N]).
+
+    Assumptions (must hold):
+      - weight_shape == (B, K, N)
+      - K_pad = k_blocks * group_size
+      - q_weight shape == [B, N, K_pad] with values in [0..2^bits-1]
+      - scale shape   == [B, N, k_blocks] (float16/float32)
+      - zero_point    == None or [B, N, k_blocks]  (uint8 values for 8b, 0..15 for 4b before packing)
+    """
+
+    assert len(weight_shape) == 3, f"weight_shape must be 3D (B,K,N), got {weight_shape}"
+    B, K, N = weight_shape
+    assert k_blocks > 0 and group_size > 0, "k_blocks and group_size must be positive."
+
+    K_pad = k_blocks * group_size
+
+    assert isinstance(q_weight, np.ndarray) and q_weight.ndim == 3, "q_weight must be [B,N,K_pad]"
+    assert q_weight.shape == (B, N, K_pad), f"q_weight.shape must be (B,N,K_pad)={(B, N, K_pad)}, got {q_weight.shape}"
+
+    assert isinstance(scale, np.ndarray) and scale.ndim == 3, "scale must be [B,N,k_blocks]"
+    assert scale.shape == (B, N, k_blocks), f"scale.shape must be (B,N,k_blocks)={(B, N, k_blocks)}, got {scale.shape}"
+    assert scale.dtype in (np.float16, np.float32), "scale must be float16/float32"
+
+    if zero_point is not None:
+        assert isinstance(zero_point, np.ndarray) and zero_point.ndim == 3, "zero_point must be [B,N,k_blocks]"
+        assert zero_point.shape == (B, N, k_blocks), (
+            f"zero_point.shape must be (B,N,k_blocks)={(B, N, k_blocks)}, got {zero_point.shape}"
+        )
+
+    def np_dtype_to_tensor_dtype(dtype: np.dtype) -> int:
+        from onnx import TensorProto
+
+        mapping = {
+            np.dtype(np.float32): TensorProto.FLOAT,
+            np.dtype(np.float16): TensorProto.FLOAT16,
+            np.dtype(np.uint8): TensorProto.UINT8,
+        }
+        return mapping.get(np.dtype(dtype), TensorProto.UNDEFINED)
+
+    q_weight_name = node.input[1] + f"_Q{num_bits}G{group_size}"
+    input_names = [node.input[0], q_weight_name]
+    new_inits = []
+    kwargs = {}
+
+    op_type = "MatMulNBits"
+
+    assert num_bits in (4, 8), f"Only 4/8 bits are supported, got {num_bits}"
+    blob_size = (group_size * num_bits) // 8
+    assert K_pad == q_weight.shape[2], "K_pad mismatch"
+    assert (num_bits != 4) or (group_size % 2 == 0), "group_size must be even for 4-bit packing"
+
+    if num_bits == 8:
+        packed = np.empty((B, N, k_blocks, blob_size), dtype=np.uint8)
+        for g in range(k_blocks):
+            ks = g * group_size
+            ke = ks + group_size
+            packed[:, :, g, :] = q_weight[:, :, ks:ke].astype(np.uint8)
+    else:
+        packed = np.empty((B, N, k_blocks, blob_size), dtype=np.uint8)
+        for g in range(k_blocks):
+            ks = g * group_size
+            ke = ks + group_size
+            slice_g = q_weight[:, :, ks:ke].astype(np.uint8)
+            low = slice_g[:, :, 0::2]
+            high = slice_g[:, :, 1::2]
+            packed[:, :, g, :] = low | (high << 4)
+
+    scale_tensor = onnx.helper.make_tensor(
+        name=node.input[1] + "_scale",
+        data_type=np_dtype_to_tensor_dtype(scale.dtype),
+        dims=list(scale.shape),
+        vals=scale.tobytes(),
+        raw=True,
+    )
+    input_names.append(scale_tensor.name)
+    new_inits.append(scale_tensor)
+
+    if zero_point is not None:
+        if num_bits == 8:
+            packed_zp = zero_point.astype(np.uint8)
+        else:
+            kb2 = (k_blocks + 1) // 2
+            packed_zp = np.empty((B, N, kb2), dtype=np.uint8)
+            zp = zero_point.astype(np.uint8)
+            packed_zp.fill(0x88)
+            even = zp[:, :, 0::2]
+            odd = zp[:, :, 1::2]
+            packed_zp[:, :, : even.shape[2]] = (packed_zp[:, :, : even.shape[2]] & 0xF0) | even
+            if odd.size > 0:
+                packed_zp[:, :, : odd.shape[2]] = (packed_zp[:, :, : odd.shape[2]] & 0x0F) | (odd << 4)
+
+        zp_tensor = onnx.helper.make_tensor(
+            name=node.input[1] + "_zp",
+            data_type=np_dtype_to_tensor_dtype(np.uint8),
+            dims=list(packed_zp.shape),
+            vals=packed_zp.tobytes(),
+            raw=True,
+        )
+        input_names.append(zp_tensor.name)
+        new_inits.append(zp_tensor)
+
+    kwargs["K"] = int(K)
+    kwargs["N"] = int(N)
+    kwargs["bits"] = int(num_bits)
+    kwargs["block_size"] = int(group_size)
+    if accuracy_level > 0:
+        kwargs["accuracy_level"] = int(accuracy_level)
+
+    q_weight_tensor = onnx.helper.make_tensor(
+        name=q_weight_name,
+        data_type=np_dtype_to_tensor_dtype(np.uint8),
+        dims=list(packed.shape),
+        vals=packed.tobytes(),
+        raw=True,
+    )
+    new_inits.append(q_weight_tensor)
+
+    matmul_weight_only_node = onnx.helper.make_node(
+        op_type,
+        inputs=input_names,
+        outputs=node.output,
+        name=(node.name + f"_Q{num_bits}") if node.name else (f"_Q{num_bits}"),
+        domain="com.microsoft",
+        **kwargs,
+    )
+    return matmul_weight_only_node, new_inits
+
+
 def quant_tensor(data, num_bits=4, group_size=32, scheme="asym", dtype="int", ratio=1.0):
     """Quantize tensor per group.
 
@@ -433,25 +572,12 @@ def rtn_quantize(
     Args:
         model (ModelProto or ONNXModel): onnx model
         weight_config (dict): quantization config
-                For example,
-                weight_config = {
-                    'fc2':
-                        {
-                            'bits': 4,
-                            'group_size': 32,
-                            'scheme': 'sym',
-                            'algorithm': 'RTN'
-                        }
-                }
         num_bits (int, optional): num_bits. Default is 4.
         group_size (int, optional): how many elements share one scale/zp. Default is 32.
         scheme (str, optional): sym or asym. Defaults to "asym".
         ratios (dict, optional): percentile of clip. Defaults to {}.
         accuracy_level (int): accuracy level. Support 0 (unset),1(fp32), 2(fp16), 3(bf16), or 4(int8).
         providers (list): providers to use
-
-    Returns:
-        model: fake quantized ONNXModel
     """
     model = ONNXModel(model)
     base_dir = os.path.dirname(model.model_path) if model.model_path is not None else ""
@@ -459,10 +585,12 @@ def rtn_quantize(
     remove_nodes = []
     total_num = len([i for i in model.nodes() if i.op_type in ["MatMul"]])
     curr_id = 0
+
     for node in model.nodes():
         if node.op_type in ["MatMul"]:
             curr_id += 1
             simple_progress_bar(total_num, curr_id)
+
         if (
             node.op_type in ["MatMul"]
             and model.get_initializer(node.input[1]) is not None
@@ -470,8 +598,6 @@ def rtn_quantize(
         ):
             weight_tensor = model.get_initializer(node.input[1])
             weight = numpy_helper.to_array(weight_tensor, base_dir=base_dir).copy()
-            if len(weight.shape) != 2:
-                continue
 
             dtype = weight.dtype
 
@@ -480,7 +606,66 @@ def rtn_quantize(
                 group_size = weight_config[node.name]["group_size"]
                 scheme = weight_config[node.name]["scheme"]
 
-            org_w_shape = weight.shape  # ic, oc
+            if weight.ndim == 3 and (num_bits == 4 or num_bits == 8):
+                B, K, N = weight.shape
+
+                eff_group_size = group_size if group_size != -1 else K
+                k_blocks = (K - 1) // eff_group_size + 1
+                K_pad = k_blocks * eff_group_size
+
+                init_share_num = model.get_initializer_share_num(node.input[1])
+
+                if K_pad != K:
+                    pad_k = K_pad - K
+                    weight_padded = np.pad(weight, ((0, 0), (0, pad_k), (0, 0)), mode="constant")
+                else:
+                    weight_padded = weight
+
+                q_list, s_list, zp_list = [], [], []
+                for b in range(B):
+                    w_b_T = weight_padded[b].T
+                    if algorithm == "k_quant":
+                        qb, sb, zpb = quant_tensor_k_quant_cuda(w_b_T, num_bits, eff_group_size)
+                    else:
+                        qb, sb, zpb = quant_tensor(
+                            w_b_T, num_bits, eff_group_size, scheme, "uint", ratios.get(node.input[1], 1)
+                        )
+                    q_list.append(qb.astype("uint8"))
+                    s_list.append(sb.astype(dtype))
+                    zp_list.append(zpb if (zpb is None) else zpb.astype("uint8"))
+
+                q_weight_3d = np.stack(q_list, axis=0)
+                scale_3d = np.stack(s_list, axis=0)
+                if zp_list[0] is None:
+                    zero_point_3d = None
+                else:
+                    zero_point_3d = np.stack(zp_list, axis=0)
+
+                q_matmul_node, new_inits = make_matmul_weight_only_node_3d(
+                    node=node,
+                    weight_shape=weight.shape,
+                    num_bits=num_bits,
+                    group_size=eff_group_size,
+                    k_blocks=k_blocks,
+                    q_weight=q_weight_3d,
+                    scale=scale_3d,
+                    zero_point=(zero_point_3d if (scheme == "asym" or algorithm == "k_quant") else None),
+                    accuracy_level=accuracy_level,
+                )
+
+                model.add_initializers(new_inits)
+                remove_nodes.append(node)
+                new_nodes.append(q_matmul_node)
+
+                if init_share_num == 1:
+                    model.remove_initializer(weight_tensor)
+
+                continue
+
+            if len(weight.shape) != 2:
+                continue
+
+            org_w_shape = weight.shape
             group_size = group_size if group_size != -1 else org_w_shape[0]
 
             k_blocks = (org_w_shape[0] - 1) // group_size + 1

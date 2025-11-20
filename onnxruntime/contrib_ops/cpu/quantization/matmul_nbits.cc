@@ -143,6 +143,11 @@ class MatMulNBits final : public OpKernel {
   IAllocatorUniquePtr<float> scales_fp32_{};
   IAllocatorUniquePtr<float> bias_fp32_{};
 
+  // NEW: 3D
+  std::vector<BufferUniquePtr> packed_b_batches_;  // גודל B
+  size_t packed_b_size_per_batch_{0};
+  bool has_multi_packed_b_{false};
+
   bool has_zp_input_{false};
 
   // dequantize B first and then compute float gemm
@@ -167,21 +172,55 @@ class MatMulNBits final : public OpKernel {
                         AllocatorPtr& allocator,
                         concurrency::ThreadPool* thread_pool,
                         const MatMulComputeHelper& helper) const;
+
+  Status ComputeBUnpacked3D(const Tensor* a,
+                            const Tensor* b,
+                            const Tensor* scales,
+                            const Tensor* zero_points,
+                            const Tensor* reorder_idx,
+                            const Tensor* bias,
+                            Tensor* y,
+                            AllocatorPtr& allocator,
+                            concurrency::ThreadPool* thread_pool,
+                            const MatMulComputeHelper& helper,
+                            int64_t B_nbits) const;
 };
 
+
 template <typename T1>
-Status MatMulNBits<T1>::PrePack(const Tensor& tensor, int input_idx, /*out*/ AllocatorPtr alloc,
+Status MatMulNBits<T1>::PrePack(const Tensor& tensor,
+                                int input_idx,
+                                /*out*/ AllocatorPtr alloc,
                                 /*out*/ bool& is_packed,
                                 /*out*/ PrePackedWeights* prepacked_weights) {
   ORT_UNUSED_PARAMETER(prepacked_weights);
   is_packed = false;
+
   if (has_g_idx_ || has_unquantized_zero_point_) {
     return Status::OK();
+  }
+
+  {
+    const TensorShape& s = tensor.Shape();
+    const int rank = s.NumDimensions();
+
+    if (input_idx == InputIndex::B && rank == 4) {
+      return Status::OK();
+    }
+
+    if (input_idx == InputIndex::scales && rank == 3 && s[0] > 1) {
+      return Status::OK();
+    }
+
+    if (input_idx == InputIndex::zero_points && rank == 3 && s[0] > 1) {
+      return Status::OK();
+    }
   }
 
   if (!MlasIsQNBitGemmAvailable(nbits_, block_size_, compute_type_)) {
     return Status::OK();
   }
+
   if (input_idx == InputIndex::B) {
     const Tensor* scales = nullptr;
     OpKernel::Info().TryGetConstantInput(InputIndex::scales, &scales);
@@ -190,14 +229,21 @@ Status MatMulNBits<T1>::PrePack(const Tensor& tensor, int input_idx, /*out*/ All
     if (packed_b_size_ == 0) {
       return Status::OK();
     }
-    auto qptr = tensor.DataRaw();
-    auto scale_ptr = scales ? scales->DataRaw() : nullptr;
+
+    const void* qptr = tensor.DataRaw();
+    const void* sptr = scales ? scales->DataRaw() : nullptr;
+
     packed_b_ = IAllocator::MakeUniquePtr<void>(alloc, packed_b_size_, true);
-    MlasQNBitGemmPackQuantBData(N_, K_, nbits_, block_size_, compute_type_, qptr, packed_b_.get(), scale_ptr,
-                                has_zp_input_, nullptr, nullptr);
+    MlasQNBitGemmPackQuantBData(
+        N_, K_, nbits_, block_size_, compute_type_,
+        qptr, /* packed_dst */ packed_b_.get(),
+        sptr,          /* scales      */
+        has_zp_input_, /* has zp      */
+        nullptr,       /* zp          */
+        nullptr);      /* reorder idx */
     is_packed = true;
+
   } else if (compute_type_ == SQNBIT_CompInt8) {
-    // Packing scales and zero points
     bool should_pack_scale_and_zp_inputs = [&]() {
 #if defined(MLAS_TARGET_AMD64_IX86)
       return true;
@@ -209,23 +255,26 @@ Status MatMulNBits<T1>::PrePack(const Tensor& tensor, int input_idx, /*out*/ All
     if (should_pack_scale_and_zp_inputs) {
       if (input_idx == InputIndex::scales && packed_b_ != nullptr) {
         auto sptr = tensor.Data<float>();
-        MlasQNBitGemmPackQuantBData(N_, K_, nbits_, block_size_, compute_type_, nullptr, packed_b_.get(), sptr,
+        MlasQNBitGemmPackQuantBData(N_, K_, nbits_, block_size_, compute_type_,
+                                    nullptr, packed_b_.get(), sptr,
                                     has_zp_input_, nullptr, nullptr);
         is_packed = false;
       }
 
-      // Packing zero_point
       if (input_idx == InputIndex::zero_points && packed_b_ != nullptr) {
         auto zptr = tensor.Data<uint8_t>();
-        MlasQNBitGemmPackQuantBData(N_, K_, nbits_, block_size_, compute_type_, nullptr, packed_b_.get(), nullptr,
+        MlasQNBitGemmPackQuantBData(N_, K_, nbits_, block_size_, compute_type_,
+                                    nullptr, packed_b_.get(), nullptr,
                                     has_zp_input_, zptr, nullptr);
         is_packed = false;
       }
     }
 
 #if defined(MLAS_TARGET_ARM64)
-    if (input_idx == InputIndex::scales && packed_b_ != nullptr &&
+    if (input_idx == InputIndex::scales &&
+        packed_b_ != nullptr &&
         MlasQNBitGemmScalesPacked(K_, nbits_, block_size_, compute_type_, has_zp_input_)) {
+      // שימי לב: זה יקרה רק במסלול 2D; ב-3D כבר חזרנו קודם.
       scales_are_packed_ = true;
       is_packed = true;
     }
@@ -238,7 +287,9 @@ Status MatMulNBits<T1>::PrePack(const Tensor& tensor, int input_idx, /*out*/ All
 #if !defined(MLAS_F16VEC_INTRINSICS_SUPPORTED) || !defined(MLAS_TARGET_ARM64)
 // Non-ARM-with-fp16-intrinsics fall back fp16 to fp32.
 template <>
-Status MatMulNBits<MLFloat16>::PrePack(const Tensor& tensor, int input_idx, /*out*/ AllocatorPtr alloc,
+Status MatMulNBits<MLFloat16>::PrePack(const Tensor& tensor,
+                                       int input_idx,
+                                       /*out*/ AllocatorPtr alloc,
                                        /*out*/ bool& is_packed,
                                        /*out*/ PrePackedWeights* prepacked_weights) {
   ORT_UNUSED_PARAMETER(prepacked_weights);
@@ -256,13 +307,30 @@ Status MatMulNBits<MLFloat16>::PrePack(const Tensor& tensor, int input_idx, /*ou
   }
 
   is_packed = false;
+
   if (has_g_idx_ || has_unquantized_zero_point_) {
     return Status::OK();
+  }
+
+  {
+    const TensorShape& s = tensor.Shape();
+    const int rank = s.NumDimensions();
+
+    if (input_idx == InputIndex::B && rank == 4) {
+      return Status::OK();
+    }
+    if (input_idx == InputIndex::scales && rank == 3 && s[0] > 1) {
+      return Status::OK();
+    }
+    if (input_idx == InputIndex::zero_points && rank == 3 && s[0] > 1) {
+      return Status::OK();
+    }
   }
 
   if (!MlasIsQNBitGemmAvailable(nbits_, block_size_, compute_type_)) {
     return Status::OK();
   }
+
   if (input_idx == InputIndex::B) {
     const Tensor* scales = nullptr;
     OpKernel::Info().TryGetConstantInput(InputIndex::scales, &scales);
@@ -280,19 +348,26 @@ Status MatMulNBits<MLFloat16>::PrePack(const Tensor& tensor, int input_idx, /*ou
     }
     auto qptr = tensor.DataRaw();
     packed_b_ = IAllocator::MakeUniquePtr<void>(alloc, packed_b_size_, true);
-    MlasQNBitGemmPackQuantBData(N_, K_, nbits_, block_size_, compute_type_, qptr, packed_b_.get(),
-                                scales_fp32_.get(), has_zp_input_, nullptr, nullptr);
+    MlasQNBitGemmPackQuantBData(N_, K_, nbits_, block_size_, compute_type_,
+                                qptr, packed_b_.get(),
+                                scales_fp32_.get(),
+                                has_zp_input_, nullptr, nullptr);
     is_packed = true;
+
   } else if (compute_type_ == SQNBIT_CompInt8) {
 #ifdef MLAS_TARGET_AMD64_IX86
     if (input_idx == InputIndex::scales && packed_b_ != nullptr) {
-      MlasQNBitGemmPackQuantBData(N_, K_, nbits_, block_size_, compute_type_, nullptr, packed_b_.get(),
-                                  scales_fp32_.get(), has_zp_input_, nullptr, nullptr);
+      MlasQNBitGemmPackQuantBData(N_, K_, nbits_, block_size_, compute_type_,
+                                  nullptr, packed_b_.get(),
+                                  scales_fp32_.get(),
+                                  has_zp_input_, nullptr, nullptr);
       is_packed = false;
     } else if (input_idx == InputIndex::zero_points && packed_b_ != nullptr) {
       auto zptr = tensor.Data<uint8_t>();
-      MlasQNBitGemmPackQuantBData(N_, K_, nbits_, block_size_, compute_type_, nullptr, packed_b_.get(),
-                                  nullptr, has_zp_input_, zptr, nullptr);
+      MlasQNBitGemmPackQuantBData(N_, K_, nbits_, block_size_, compute_type_,
+                                  nullptr, packed_b_.get(),
+                                  nullptr, has_zp_input_,
+                                  zptr, nullptr);
       is_packed = false;
     }
 #endif  // MLAS_TARGET_AMD64_IX86
@@ -300,7 +375,7 @@ Status MatMulNBits<MLFloat16>::PrePack(const Tensor& tensor, int input_idx, /*ou
 
   return Status::OK();
 }
-#endif  // end !MLAS_F16VEC_INTRINSICS_SUPPORTED || !MLAS_TARGET_ARM64
+#endif
 
 template <typename T1>
 Status MatMulNBits<T1>::UseSharedPrePackedBuffers(std::vector<BufferUniquePtr>& prepacked_buffers, int input_idx,
@@ -733,28 +808,297 @@ Status MatMulNBits<MLFloat16>::ComputeBUnpacked(const Tensor* a,
   return Status::OK();
 }
 
+template <>
+Status MatMulNBits<float>::ComputeBUnpacked3D(const Tensor* a,
+                                              const Tensor* b,
+                                              const Tensor* scales,
+                                              const Tensor* zero_points,
+                                              const Tensor* reorder_idx,
+                                              const Tensor* bias,
+                                              Tensor* y,
+                                              AllocatorPtr& allocator,
+                                              concurrency::ThreadPool* thread_pool,
+                                              const MatMulComputeHelper& helper,
+                                              int64_t B_nbits) const {
+  ORT_ENFORCE(b != nullptr,
+              "3D path (ComputeBUnpacked3D) currently requires unpacked B tensor");
+  ORT_ENFORCE(scales != nullptr,
+              "3D path (ComputeBUnpacked3D) requires 'scales' tensor");
+
+  const auto* a_data = a->Data<float>();
+  const uint8_t* b_data = b->Data<uint8_t>();
+  const auto* scales_data = scales->Data<float>();
+  const void* zero_points_data_raw = zero_points ? zero_points->DataRaw() : nullptr;
+  const auto* reorder_idx_data = reorder_idx ? reorder_idx->Data<int32_t>() : nullptr;
+  auto* y_data = y->MutableData<float>();
+
+  const size_t batch_count = helper.OutputOffsets().size();
+  const size_t M = static_cast<size_t>(helper.M());
+  const size_t N = static_cast<size_t>(helper.N());
+  const size_t K = static_cast<size_t>(helper.K());
+  const size_t lda = helper.Lda(false);
+  const size_t ldb = helper.Ldb(true);
+
+  // ---- צורות של B/scales/zero_points כדי לדעת את הגדלים לכל B ----
+  const auto& b_q_shape = b->Shape();
+  ORT_ENFORCE(b_q_shape.NumDimensions() == 4 && b_q_shape[0] == B_nbits,
+              "3D path expects quantized B with shape [B,N,k_blocks,blob_size]");
+  const int64_t N_q = b_q_shape[1];
+  const int64_t k_blocks = b_q_shape[2];
+  const int64_t blob_size = b_q_shape[3];
+  ORT_ENFORCE(N_q == static_cast<int64_t>(N),
+              "Mismatch in N dimension between helper and quantized B");
+
+  const auto& s_shape = scales->Shape();
+  const auto& zp_shape = zero_points ? zero_points->Shape() : TensorShape{};
+
+  const size_t per_b_q_size =
+      static_cast<size_t>(N) *
+      static_cast<size_t>(k_blocks) *
+      static_cast<size_t>(blob_size);
+
+  // dequantized B נאחסן ברצף: B מטריצות כל אחת בגודל KxN
+  const size_t per_b_deq_size =
+      static_cast<size_t>(K_) * static_cast<size_t>(N_);
+  auto tmp_b_data_ptr = IAllocator::MakeUniquePtr<float>(
+      allocator,
+      SafeInt<size_t>(B_nbits) * per_b_deq_size,
+      true);
+
+  // ---- 1) dequantize לכל B (fast path – בלי reorder_idx ובלי zero_points מסוג float) ----
+  if ((reorder_idx_data == nullptr) && (!zero_points || !zero_points->IsDataType<float>())) {
+    for (int64_t b_idx = 0; b_idx < B_nbits; ++b_idx) {
+      // סלייס מהמשקלים הקוונטיים – [N,k_blocks,blob_size] עבור אותו B
+      const uint8_t* b_slice =
+          b_data + static_cast<size_t>(b_idx) * per_b_q_size;
+
+      // scales עבור אותו B (אם יש ממד B, אחרת משתמשים בסקיילס משותף)
+      const float* scales_slice = nullptr;
+      if (s_shape.NumDimensions() == 3 && s_shape[0] == B_nbits) {
+        // [B,N,k_blocks] או [B,N,1]
+        const int64_t s_last = s_shape[2];  // k_blocks או 1
+        const size_t per_b_s =
+            static_cast<size_t>(N) * static_cast<size_t>(s_last);
+        scales_slice = scales_data +
+                       static_cast<size_t>(b_idx) * per_b_s;
+      } else if (s_shape.NumDimensions() == 2 && s_shape[0] == B_nbits) {
+        // [B,N]
+        const size_t per_b_s = static_cast<size_t>(N);
+        scales_slice = scales_data +
+                       static_cast<size_t>(b_idx) * per_b_s;
+      } else {
+        // 2D legacy – אותו scales לכל B
+        scales_slice = scales_data;
+      }
+
+      // zero_points עבור אותו B (אם יש ממד B, אחרת משותף)
+      const uint8_t* zp_slice = nullptr;
+      if (zero_points_data_raw) {
+        if (zp_shape.NumDimensions() == 3 && zp_shape[0] == B_nbits) {
+          // [B,N,zp_blob]
+          const int64_t zp_last = zp_shape[2];
+          const size_t per_b_zp =
+              static_cast<size_t>(N) * static_cast<size_t>(zp_last);
+          zp_slice = static_cast<const uint8_t*>(zero_points_data_raw) +
+                     static_cast<size_t>(b_idx) * per_b_zp;
+        } else if (zp_shape.NumDimensions() == 2 && zp_shape[0] == B_nbits) {
+          // [B,N]
+          const size_t per_b_zp = static_cast<size_t>(N);
+          zp_slice = static_cast<const uint8_t*>(zero_points_data_raw) +
+                     static_cast<size_t>(b_idx) * per_b_zp;
+        } else {
+          // 2D / 1D – אותו zero_point לכל B
+          zp_slice = static_cast<const uint8_t*>(zero_points_data_raw);
+        }
+      }
+
+      // יעד dequantized עבור אותו B – מטריצה בגודל KxN
+      float* deq_slice =
+          tmp_b_data_ptr.get() +
+          static_cast<size_t>(b_idx) * per_b_deq_size;
+
+      // אותו קוד כמו ב-2D, רק על הסלייסים
+      if (nbits_ == 2) {
+        MlasDequantizeBlockwise<float, 2>(
+            deq_slice,                          // dequantized output
+            b_slice,                            // quantized input
+            scales_slice,                       // quantization scales
+            zp_slice,                           // quantization zero points (uint8)
+            static_cast<int32_t>(block_size_),  // block size
+            column_wise_quant_,                 // columnwise or row-wise
+            static_cast<int32_t>(K_),           // rows
+            static_cast<int32_t>(N_),           // cols
+            thread_pool);
+      } else if (nbits_ == 4) {
+        MlasDequantizeBlockwise<float, 4>(
+            deq_slice,
+            b_slice,
+            scales_slice,
+            zp_slice,
+            static_cast<int32_t>(block_size_),
+            column_wise_quant_,
+            static_cast<int32_t>(K_),
+            static_cast<int32_t>(N_),
+            thread_pool);
+      } else {
+        ORT_ENFORCE(nbits_ == 8);
+        MlasDequantizeBlockwise<float, 8>(
+            deq_slice,
+            b_slice,
+            scales_slice,
+            zp_slice,
+            static_cast<int32_t>(block_size_),
+            column_wise_quant_,
+            static_cast<int32_t>(K_),
+            static_cast<int32_t>(N_),
+            thread_pool);
+      }
+    }
+  } else {
+    // כרגע בשביל פשטות – לא תומכים במצב הנדיר של reorder_idx או zero_points מסוג float ב-3D
+    return ORT_MAKE_STATUS(
+        ONNXRUNTIME, NOT_IMPLEMENTED,
+        "3D MatMulNBits float path currently supports only MLAS blockwise "
+        "dequantization (no reorder_idx, zero_points must be uint8 or null).");
+  }
+
+#if 0  // for debug – אם תרצי לשמור, כמו בקוד המקורי
+  auto tm_b_data_ptr_trans =
+      IAllocator::MakeUniquePtr<float>(allocator, SafeInt<size_t>(K_) * N_);
+  MlasTranspose(tmp_b_data_ptr.get(), tm_b_data_ptr_trans.get(), N_, K_);
+#endif
+
+  // ---- 2) בונים את פרמטרי ה-GEMM בדיוק כמו 2D, רק שעכשיו RightOffsets מפנים לסלייס הנכון ----
+  std::vector<MLAS_SGEMM_DATA_PARAMS> data(batch_count);
+  for (size_t i = 0; i < batch_count; i++) {
+    data[i].BIsPacked = false;
+    data[i].A = a_data + helper.LeftOffsets()[i];
+    data[i].lda = lda;
+    data[i].B = tmp_b_data_ptr.get() + helper.RightOffsets()[i];
+    data[i].ldb = ldb;
+    data[i].C = y_data + helper.OutputOffsets()[i];
+    data[i].ldc = N;
+    data[i].alpha = 1.f;
+    data[i].beta = 0.0f;
+  }
+
+  // ---- 3) bias – אותו קוד כמו ב-2D ----
+  if (bias) {
+    gsl::span<const float> bias_span = bias->DataAsSpan<float>();
+    for (size_t i = 0; i < batch_count; ++i) {
+      float* C_row = data[i].C;
+      const size_t ldc = data[i].ldc;
+      for (size_t m = 0; m < M; ++m) {
+        memcpy(C_row, bias_span.data(), bias_span.size_bytes());
+        C_row += ldc;
+      }
+
+      data[i].beta = 1.0f;
+    }
+  }
+
+  // ---- 4) ה-GEMM עצמו – אותו דבר ----
+  MlasGemmBatch(CblasNoTrans, CblasTrans,
+                M, N, K, data.data(), batch_count, thread_pool);
+
+  return Status::OK();
+}
+
+template <>
+Status MatMulNBits<MLFloat16>::ComputeBUnpacked3D(
+    const Tensor* a,
+    const Tensor* b,
+    const Tensor* scales,
+    const Tensor* zero_points,
+    const Tensor* reorder_idx,
+    const Tensor* bias,
+    Tensor* y,
+    AllocatorPtr& allocator,
+    concurrency::ThreadPool* thread_pool,
+    const MatMulComputeHelper& helper,
+    int64_t B_nbits) const {
+  ORT_UNUSED_PARAMETER(a);
+  ORT_UNUSED_PARAMETER(b);
+  ORT_UNUSED_PARAMETER(scales);
+  ORT_UNUSED_PARAMETER(zero_points);
+  ORT_UNUSED_PARAMETER(reorder_idx);
+  ORT_UNUSED_PARAMETER(bias);
+  ORT_UNUSED_PARAMETER(y);
+  ORT_UNUSED_PARAMETER(allocator);
+  ORT_UNUSED_PARAMETER(thread_pool);
+  ORT_UNUSED_PARAMETER(helper);
+  ORT_UNUSED_PARAMETER(B_nbits);
+
+  return ORT_MAKE_STATUS(
+      ONNXRUNTIME, NOT_IMPLEMENTED,
+      "3D MatMulNBits unpacked path is not implemented for MLFloat16.");
+}
+
 template <typename T1>
 Status MatMulNBits<T1>::Compute(OpKernelContext* ctx) const {
   concurrency::ThreadPool* thread_pool = ctx->GetOperatorThreadPool();
   const Tensor* a = ctx->Input<Tensor>(InputIndex::A);
-  // If B is prepacked, B would have been removed from the context
-  const bool is_b_prepacked = packed_b_size_ > 0;
+
+  // מצב prepack כפי שנקבע ב-PrePack
+  bool is_b_prepacked = packed_b_size_ > 0;
   const Tensor* b = is_b_prepacked ? nullptr : ctx->Input<Tensor>(InputIndex::B);
-  const Tensor* scales = scales_are_packed_ ? nullptr : ctx->Input<Tensor>(InputIndex::scales);
+  bool are_scales_packed = scales_are_packed_;
+  const Tensor* scales = are_scales_packed ? nullptr : ctx->Input<Tensor>(InputIndex::scales);
   const Tensor* zero_points = ctx->Input<Tensor>(InputIndex::zero_points);
   const Tensor* reorder_idx = ctx->Input<Tensor>(InputIndex::g_idx);
   const Tensor* bias = ctx->Input<Tensor>(InputIndex::bias);
 
+  // --- זיהוי B (batch) לפי צורת המשקל/סקיילים ---
+  int64_t B_w = 1;
+  if (!is_b_prepacked && b != nullptr) {
+    const auto& b_q_shape = b->Shape();
+    if (b_q_shape.NumDimensions() == 4) {
+      B_w = b_q_shape[0];  // [B, N, k_blocks, blob_size]
+    }
+  }
+
+  int64_t B_s = 1;
+  if (!are_scales_packed && scales != nullptr) {
+    const auto& s_shape = scales->Shape();
+    const int s_rank = s_shape.NumDimensions();
+    if (s_rank == 3) {
+      B_s = s_shape[0];  // [B, N, k_blocks]
+    } else if (s_rank == 2 && s_shape[0] != static_cast<int64_t>(N_)) {
+      B_s = s_shape[0];  // [B, N] (ללא קיבוץ)
+    }
+  }
+
+  const int64_t B_nbits = std::max(B_w, B_s);
+
+  // --- אם זיהינו 3D: נטרל prepack ואז קַשר מחדש את המצביעים --- ★
+  if (B_nbits > 1) {
+    if (packed_b_size_ > 0 || scales_are_packed_) {
+      LOGS(ctx->Logger(), WARNING)
+          << "MatMulNBits: disabling prepacked state for batched weights/scales.";
+    }
+
+    // לאחר נטרול, לקרוא מחדש את הקלטים כדי לקבל את הטנזורים עצמם ★
+    is_b_prepacked = false;
+    are_scales_packed = false;
+    b = ctx->Input<Tensor>(InputIndex::B);
+    scales = ctx->Input<Tensor>(InputIndex::scales);
+  }
+
+  // --- הבדיקה/ולידציה חייבת להיות אחרי הנטרול וה-rebind --- ★
   ORT_RETURN_IF_ERROR(matmul_nbits_helper::CheckInputs<Tensor>(
       a, b, scales, zero_points, reorder_idx, bias, N_, K_, block_size_, nbits_));
 
-  TensorShape b_shape({static_cast<int64_t>(N_), static_cast<int64_t>(K_)});
+  // *** אל תחזירי יותר ORT_ENFORCE על prepack ב-3D ***
+
+  // Prepare logical shape of B for MatMulComputeHelper
+  TensorShape b_shape = (B_nbits == 1)
+                            ? TensorShape({static_cast<int64_t>(N_), static_cast<int64_t>(K_)})
+                            : TensorShape({B_nbits, static_cast<int64_t>(N_), static_cast<int64_t>(K_)});
+
   MatMulComputeHelper helper;
-  ORT_RETURN_IF_ERROR(helper.Compute(a->Shape(), b_shape, false, true));
+  ORT_RETURN_IF_ERROR(helper.Compute(a->Shape(), b_shape, false, /*transB=*/true));
 
   Tensor* y = ctx->Output(0, helper.OutputShape());
-
-  // Bail out early if the output is going to be empty
   if (y->Shape().Size() == 0) {
     return Status::OK();
   }
@@ -762,31 +1106,27 @@ Status MatMulNBits<T1>::Compute(OpKernelContext* ctx) const {
   AllocatorPtr allocator;
   ORT_RETURN_IF_ERROR(ctx->GetTempSpaceAllocator(&allocator));
 
-  // clang-format off
-  const bool has_single_b_matrix = std::all_of(
-      helper.RightOffsets().begin(),
-      helper.RightOffsets().end(),
-      [](size_t offset) { return offset == 0; });
-  // clang-format on
+  const bool has_single_b_matrix =
+      std::all_of(helper.RightOffsets().begin(), helper.RightOffsets().end(),
+                  [](size_t offset) { return offset == 0; });
 
-  if (has_single_b_matrix &&
-      packed_b_) {  // Assume that MlasQNBitGemmBatch() always requires packed B.
-                    // If this changes, i.e., if MlasIsQNBitGemmAvailable() can return true while
-                    // MlasQNBitGemmPackQuantBDataSize() returns 0, we can consider calling MlasQNBitGemmBatch()
-                    // with B directly too.
-    if (MlasIsQNBitGemmAvailable(nbits_, block_size_, compute_type_)) {
-      return ComputeBPacked(a, scales, zero_points, bias, y, allocator, thread_pool, helper);
-    }
+  if (B_nbits == 1 && has_single_b_matrix && packed_b_ &&
+      MlasIsQNBitGemmAvailable(nbits_, block_size_, compute_type_)) {
+    return ComputeBPacked(a, scales, zero_points, bias, y, allocator, thread_pool, helper);
   }
 
-  // TODO(hasesh): Should this logging level be warning ?
-  LOGS(ctx->Logger(), INFO) << "Falling back to using unpacked compute mode for the Matmul operation "
-                               "(i.e.) the weights will be de-quantized to fp32 before invoking "
-                               "the fp32 Matmul kernel."
-                               "This is because MLAS doesn't have an optimized quantized kernel "
-                               "for the requested compute configuration.";
+  LOGS(ctx->Logger(), INFO)
+      << "Falling back to unpacked compute mode for MatMulNBits.";
 
-  return ComputeBUnpacked(a, b, scales, zero_points, reorder_idx, bias, y, allocator, thread_pool, helper);
+  if (B_nbits > 1) {
+    // נתיב 3D (unpacked)
+    return ComputeBUnpacked3D(a, b, scales, zero_points, reorder_idx, bias,
+                              y, allocator, thread_pool, helper, B_nbits);
+  }
+
+  // נתיב 2D (unpacked)
+  return ComputeBUnpacked(a, b, scales, zero_points, reorder_idx, bias,
+                          y, allocator, thread_pool, helper);
 }
 
 #define REGISTER_MatMulNBits(T1)                                         \
